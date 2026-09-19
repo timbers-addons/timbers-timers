@@ -1,0 +1,14 @@
+package-as: TimbersTimers
+move-folders:
+  TimbersTimers/Src: TimbersTimers
+
+enable-nolib-creation: no
+
+ignore:
+  - Src/Dev
+  - .publish
+  - Images
+  - Screenshots
+  - README.md
+  - CHANGELOG.md
+  - LICENSE
