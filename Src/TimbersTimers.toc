@@ -2,7 +2,7 @@
 ## Title: Timber's Timers
 ## Notes: Tracks short-term buffs and debuffs with countdown bars
 ## Author: Timberwind-DreamscytheUS
-## Version: v2026.10.16h
+## Version: v2026.10.16i
 ## DefaultState: enabled
 ## SavedVariables: TimbersTimersSV
 ## X-License: gpl-3.0-only
