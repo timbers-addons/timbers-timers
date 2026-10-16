@@ -430,8 +430,8 @@ function TT:UpdateTrackedUnit(guid, unitName, unit, filter)
 
     local existing = self.tracked[guid]
     if existing then
-        -- Check if the aura set changed (spells added/removed); count/expiresAt
-        -- updates are handled by OnUpdate without a rebuild.
+        -- Check if the aura set changed (spells added/removed). When it has
+        -- not, the values are refreshed in place without a rebuild.
         local changed = false
         for k in pairs(auras) do
             if not existing.auras[k] then changed = true; break end
@@ -442,10 +442,20 @@ function TT:UpdateTrackedUnit(guid, unitName, unit, filter)
             end
         end
         if not changed then
-            -- Refresh expiry/count values in-place so bars stay smooth
+            -- Refresh expiry and count in place so bars stay smooth. OnUpdate
+            -- reads the expiry every frame, so that needs nothing more, but
+            -- the label is only written when it changes: a restacking aura
+            -- (Lifebloom going 2 to 3, say) has to set it here or the bar
+            -- keeps showing the old count.
+            local barMap = self.bars[guid]
             for k, a in pairs(auras) do
-                existing.auras[k].expiresAt = a.expiresAt
-                existing.auras[k].count     = a.count
+                local current = existing.auras[k]
+                current.expiresAt = a.expiresAt
+                if current.count ~= a.count then
+                    current.count = a.count
+                    local bar = barMap and barMap[k]
+                    if bar then self:SetBarLabel(bar, current) end
+                end
             end
             existing.name = unitName
             return
