@@ -58,6 +58,12 @@ TT.isMidnightEngine =
         and WOW_PROJECT_ID == WOW_PROJECT_MAINLINE)
 TT.canUseCombatLog = not TT.isMidnightEngine
 
+-- Group size and shape.  Present on every client we run on, but kept here
+-- with fallbacks so a missing one degrades to "solo" instead of erroring in
+-- the main chunk.
+TT.IsInRaid = IsInRaid or function() return false end
+TT.GetNumGroupMembers = GetNumGroupMembers or function() return 0 end
+
 -- Addon metadata moved under C_AddOns on the retail engine.
 local GetMetadata = (C_AddOns and C_AddOns.GetAddOnMetadata) or GetAddOnMetadata
 TT.version = (GetMetadata and GetMetadata("TimbersTimers", "Version")) or "unknown"
@@ -251,7 +257,10 @@ TT.frame:SetScript("OnEvent", function(self, event, ...)
     elseif event == "PLAYER_TARGET_CHANGED"      then TT:OnUnitScan("target")
     elseif event == "PLAYER_FOCUS_CHANGED"       then TT:OnUnitScan("focus")
     elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then TT:OnCombatLog()
-    elseif event == "GROUP_ROSTER_UPDATE"        then TT:RefreshAll()
+    -- Roster changes only rebuild the scan list.  This fires repeatedly while
+    -- a raid forms, and a full rescan each time would be a burst; the sweep
+    -- picks the new members up within SWEEP_INTERVAL.
+    elseif event == "GROUP_ROSTER_UPDATE"        then TT:RebuildGroupUnits()
     end
 end)
 
@@ -354,9 +363,9 @@ end
 function TT:OnUnitAura(unit)
     if not TT.IsReadable(unit) then return end
     if unit == "player" or unit == "target" or unit == "focus"
-    or unit == "pet"    or unit:match("^party%d$") then
+    or unit == "pet"    or unit:match("^party%d$") or unit:match("^raid%d+$") then
         self:OnUnitScan(unit)
-    elseif unit:match("^partypet%d$") then
+    elseif unit:match("^partypet%d$") or unit:match("^raidpet%d+$") then
         self:OnUnitScan(unit, TT.partySpells)
     end
 end
@@ -379,14 +388,36 @@ function TT:OnUnitScan(unit, filter)
     self:UpdateTrackedUnit(guid, name or guid, unit, filter)
 end
 
+-- The group unit tokens worth scanning, rebuilt when the roster changes
+-- rather than every frame.  party and raid tokens never coexist: in a raid
+-- party1-4 are nil, which is why raid groups showed nothing before.  In a
+-- raid the player also appears as one of the raid units; scanning both is
+-- harmless, since a rescan of the same GUID with the same auras is a no-op.
+local MAX_RAID = 40
+
+function TT:RebuildGroupUnits()
+    local units = { { unit = "player" }, { unit = "pet" } }
+    if TT.IsInRaid() then
+        local n = math.min(tonumber(TT.GetNumGroupMembers()) or 0, MAX_RAID)
+        for i = 1, n do
+            units[#units + 1] = { unit = "raid"    .. i }
+            units[#units + 1] = { unit = "raidpet" .. i, filter = TT.partySpells }
+        end
+    else
+        for i = 1, 4 do
+            units[#units + 1] = { unit = "party"    .. i }
+            units[#units + 1] = { unit = "partypet" .. i, filter = TT.partySpells }
+        end
+    end
+    self.groupUnits = units
+end
+
 function TT:RefreshAll()
-    self:OnUnitScan("player")
+    self:RebuildGroupUnits()
     self:OnUnitScan("target")
     self:OnUnitScan("focus")
-    self:OnUnitScan("pet")
-    for i = 1, 4 do
-        self:OnUnitScan("party"    .. i)
-        self:OnUnitScan("partypet" .. i, TT.partySpells)
+    for _, u in ipairs(self.groupUnits) do
+        self:OnUnitScan(u.unit, u.filter)
     end
 end
 
@@ -581,25 +612,43 @@ end
 -- ============================================================
 -- UPDATE LOOP (~20 Hz)
 -- ============================================================
-TT.updateThrottle  = 0
-TT.partyScanTimer  = 0
-local PARTY_SCAN_INTERVAL = 5  -- re-scan party/pets every 5 seconds
+TT.updateThrottle = 0
+TT.sweepCursor    = 0
+TT.sweepIndex     = 0
+local TICK           = 0.05
+local SWEEP_INTERVAL = 5  -- seconds for one pass over the whole group
+
+-- Safety net for UNIT_AURA events the client drops.  Rather than rescanning
+-- the group in one burst, this walks it at a rate that covers the roster
+-- exactly once per SWEEP_INTERVAL, so a full raid costs no more per frame
+-- than a party does: the list gets longer, each unit's turn comes round
+-- less often, and the per-tick work stays flat.
+function TT:SweepGroup(elapsed)
+    if not self.groupUnits then self:RebuildGroupUnits() end
+    local units = self.groupUnits
+    local n = #units
+    if n == 0 then return end
+
+    self.sweepCursor = self.sweepCursor + (n / SWEEP_INTERVAL) * elapsed
+    local due = math.floor(self.sweepCursor)
+    if due < 1 then return end
+    self.sweepCursor = self.sweepCursor - due
+    if due > n then due = n end  -- after a stall, one pass is enough
+
+    for _ = 1, due do
+        self.sweepIndex = self.sweepIndex % n + 1
+        local u = units[self.sweepIndex]
+        self:OnUnitScan(u.unit, u.filter)
+    end
+end
 
 function TT:OnUpdate(elapsed)
     self.updateThrottle = self.updateThrottle + elapsed
-    if self.updateThrottle < 0.05 then return end
+    if self.updateThrottle < TICK then return end
+    local sinceLastTick = self.updateThrottle
     self.updateThrottle = 0
 
-    -- Periodic full re-scan of party and party pets to catch missed UNIT_AURA events
-    self.partyScanTimer = self.partyScanTimer + 0.05
-    if self.partyScanTimer >= PARTY_SCAN_INTERVAL then
-        self.partyScanTimer = 0
-        self:OnUnitScan("pet")
-        for i = 1, 4 do
-            self:OnUnitScan("party"    .. i)
-            self:OnUnitScan("partypet" .. i, TT.partySpells)
-        end
-    end
+    self:SweepGroup(sinceLastTick)
 
     local _, _, home = GetNetStats()
     self.config.latency = (home or 0) / 1000
