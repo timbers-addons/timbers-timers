@@ -459,18 +459,12 @@ function TT:UpdateTrackedUnit(guid, unitName, unit, filter)
     self:RebuildBars()
 end
 
+-- Drops the unit from the tracked set only. SyncBars owns releasing frames,
+-- so that happens in one place and a frame cannot reach the pool twice.
 function TT:RemoveGUID(guid)
     self.tracked[guid] = nil
     for i, g in ipairs(self.guidOrder) do
         if g == guid then table.remove(self.guidOrder, i) break end
-    end
-    if self.bars[guid] then
-        for _, bar in pairs(self.bars[guid]) do self:ReleaseBar(bar) end
-        self.bars[guid] = nil
-    end
-    if self.headers[guid] then
-        self:ReleaseHeader(self.headers[guid])
-        self.headers[guid] = nil
     end
     self:RebuildBars()
 end
@@ -562,43 +556,96 @@ end
 -- ============================================================
 -- LAYOUT
 -- ============================================================
-function TT:RebuildBars()
-    local cfg = self.config
+function TT:SetBarLabel(bar, aura)
+    bar.label:SetText(aura.count and aura.count > 1
+        and (aura.name .. " (" .. aura.count .. ")") or aura.name)
+end
 
-    for _, barMap in pairs(self.bars) do
-        for _, bar in pairs(barMap) do self:ReleaseBar(bar) end
+function TT:SetBarContent(bar, guid, spellKey, aura)
+    bar.guid     = guid
+    bar.spellKey = spellKey
+    bar.aura     = aura
+    self:SetBarLabel(bar, aura)
+    bar.icon:SetTexture(aura.icon)
+    bar.fill:SetVertexColor(aura.isDebuff and 0.78 or 0.12,
+                            aura.isDebuff and 0.12 or 0.58,
+                            0.12, 1)
+end
+
+-- Bring the bar and header frames in line with what is tracked, touching only
+-- what actually changed.  A surviving bar keeps its frame, its icon and its
+-- colour; all it needs is the new aura table, since UpdateTrackedUnit replaces
+-- that wholesale when a unit's aura set changes and a stale one would make the
+-- countdown read from the wrong expiry.
+function TT:SyncBars()
+    -- Units and auras that are gone. Clearing a key during pairs() is allowed.
+    for guid, barMap in pairs(self.bars) do
+        local data  = self.tracked[guid]
+        local auras = data and data.auras
+        if not auras or not next(auras) then
+            for _, bar in pairs(barMap) do self:ReleaseBar(bar) end
+            self.bars[guid] = nil
+            if self.headers[guid] then
+                self:ReleaseHeader(self.headers[guid])
+                self.headers[guid] = nil
+            end
+        else
+            for spellKey, bar in pairs(barMap) do
+                if not auras[spellKey] then
+                    self:ReleaseBar(bar)
+                    barMap[spellKey] = nil
+                end
+            end
+        end
     end
-    self.bars = {}
-    for _, h in pairs(self.headers) do self:ReleaseHeader(h) end
-    self.headers = {}
 
+    -- Units and auras that are new.
+    for guid, data in pairs(self.tracked) do
+        if next(data.auras) then
+            local barMap = self.bars[guid]
+            if not barMap then
+                barMap = {}
+                self.bars[guid] = barMap
+            end
+            if not self.headers[guid] then
+                self.headers[guid] = self:AcquireHeader()
+            end
+            self.headers[guid]:SetText(data.name)
+
+            for spellKey, aura in pairs(data.auras) do
+                local bar = barMap[spellKey]
+                if not bar then
+                    bar = self:AcquireBar()
+                    barMap[spellKey] = bar
+                    self:SetBarContent(bar, guid, spellKey, aura)
+                else
+                    if bar.aura.count ~= aura.count then self:SetBarLabel(bar, aura) end
+                    bar.aura = aura
+                end
+            end
+        end
+    end
+end
+
+-- Position whatever survived.  Still walks every bar, because a group losing a
+-- bar shifts everything below it, but moving a frame is far cheaper than
+-- tearing it down and building it again.
+function TT:LayoutBars()
+    local cfg     = self.config
     local barLeft = cfg.barHeight + 4
     local yOffset = cfg.titleHeight + 4
 
     for _, guid in ipairs(self.guidOrder) do
-        local data = self.tracked[guid]
-        if data and next(data.auras) then
-            local h = self:AcquireHeader()
-            h:ClearAllPoints()
-            h:SetPoint("TOPLEFT", self.frame, "TOPLEFT", barLeft, -yOffset)
-            h:SetText(data.name)
-            self.headers[guid] = h
+        local header = self.headers[guid]
+        local barMap = self.bars[guid]
+        if header and barMap then
+            header:ClearAllPoints()
+            header:SetPoint("TOPLEFT", self.frame, "TOPLEFT", barLeft, -yOffset)
             yOffset = yOffset + cfg.headerHeight + cfg.headerGap
 
-            self.bars[guid] = {}
-            for spellKey, aura in pairs(data.auras) do
-                local bar = self:AcquireBar()
+            for _, bar in pairs(barMap) do
                 bar:ClearAllPoints()
                 bar:SetPoint("TOPLEFT", self.frame, "TOPLEFT", barLeft, -yOffset)
-                bar.guid     = guid
-                bar.spellKey = spellKey
-                bar.aura     = aura
-                bar.label:SetText(aura.count and aura.count > 1 and (aura.name .. " (" .. aura.count .. ")") or aura.name)
-                bar.icon:SetTexture(aura.icon)
-                bar.fill:SetVertexColor(aura.isDebuff and 0.78 or 0.12,
-                                        aura.isDebuff and 0.12 or 0.58,
-                                        0.12, 1)
-                self.bars[guid][spellKey] = bar
                 yOffset = yOffset + cfg.barHeight + cfg.barSpacing
             end
             yOffset = yOffset + cfg.groupSpacing
@@ -607,6 +654,11 @@ function TT:RebuildBars()
 
     -- Shrink/grow frame to exactly fit content so it doesn't block clicks below it
     self.frame:SetHeight(math.max(cfg.titleHeight + 4, yOffset))
+end
+
+function TT:RebuildBars()
+    self:SyncBars()
+    self:LayoutBars()
 end
 
 -- ============================================================
@@ -675,25 +727,21 @@ function TT:OnUpdate(elapsed)
         end
     end
 
-    local needRebuild = false
+    -- Only the tracked set is edited here; SyncBars releases the frames.
     for _, e in ipairs(expired) do
         local guid, spellKey = e.guid, e.spellKey
-        local bar = self.bars[guid] and self.bars[guid][spellKey]
-        if bar then self:ReleaseBar(bar); self.bars[guid][spellKey] = nil end
-        needRebuild = true
-        if self.tracked[guid] then
-            self.tracked[guid].auras[spellKey] = nil
-            if next(self.tracked[guid].auras) == nil then
+        local data = self.tracked[guid]
+        if data then
+            data.auras[spellKey] = nil
+            if next(data.auras) == nil then
                 self.tracked[guid] = nil
                 for i, g in ipairs(self.guidOrder) do
                     if g == guid then table.remove(self.guidOrder, i) break end
                 end
-                if self.headers[guid] then self:ReleaseHeader(self.headers[guid]); self.headers[guid] = nil end
-                self.bars[guid] = nil
             end
         end
     end
-    if needRebuild then self:RebuildBars() end
+    if #expired > 0 then self:RebuildBars() end
 end
 
 -- ============================================================
