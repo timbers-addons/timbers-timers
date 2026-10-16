@@ -457,7 +457,16 @@ function TT:UpdateTrackedUnit(guid, unitName, unit, filter)
                     if bar then self:SetBarLabel(bar, current) end
                 end
             end
-            existing.name = unitName
+            -- The heading has the same problem as the label, and it shows up
+            -- on the Midnight engine: OnUnitScan falls back to the raw GUID
+            -- when UnitName comes back secret inside an instance, so a unit
+            -- first seen there would keep the GUID as its heading once the
+            -- name became readable again.
+            if existing.name ~= unitName then
+                existing.name = unitName
+                local header = self.headers[guid]
+                if header then header:SetText(unitName) end
+            end
             return
         end
         existing.name  = unitName
