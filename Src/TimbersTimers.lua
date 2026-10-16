@@ -5,6 +5,89 @@ TimbersTimers = {}
 local TT = TimbersTimers
 
 -- ============================================================
+-- CLIENT COMPATIBILITY
+-- TBC Anniversary runs the pre-Cataclysm API; WoW: Forever runs the Midnight
+-- (retail) engine, which dropped the aura globals and hands addons "secret"
+-- values for some unit state.  This section is the only place that touches a
+-- client-specific global; everything below calls these wrappers.
+-- ============================================================
+local UnitBuff_   = UnitBuff
+local UnitDebuff_ = UnitDebuff
+local GetAuraDataByIndex = C_UnitAuras and C_UnitAuras.GetAuraDataByIndex
+local GetCombatLogEvent  = CombatLogGetCurrentEventInfo
+
+-- A secret value can be held and passed on, but comparing, testing or doing
+-- arithmetic on one errors.  Inside instances the engine hands them out for
+-- unit state, and whether it does varies per call, so nothing is latched:
+-- every value the addon is about to branch on is checked first.
+local function compareString(value)
+    return value == ""
+end
+function TT.IsReadable(...)
+    local hasCheck = type(issecretvalue) == "function"
+    for i = 1, select("#", ...) do
+        local value = select(i, ...)
+        if hasCheck then
+            if issecretvalue(value) then return false end
+        elseif not pcall(compareString, value) then
+            return false
+        end
+    end
+    return true
+end
+
+-- COMBAT_LOG_EVENT_UNFILTERED is reserved for the Blizzard UI on the retail
+-- (Midnight) engine.  Registering it raises ADDON_ACTION_FORBIDDEN and puts a
+-- dialog in the user's face, and it cannot be probed for first -- asking is
+-- the failure -- so it is gated on the client rather than tested.  Verified
+-- refused on Forever 1.60.1, interface 16001, 2026-10-16; the other six events
+-- this addon registers were all accepted.  Pre-Cataclysm clients are fine.
+--
+-- Two independent signals, because getting this wrong puts a dialog in the
+-- user's face.  The pre-Cataclysm clients still expose the aura globals and
+-- the Midnight engine removed them; separately, a client reporting itself as
+-- mainline is on that engine too.  Either being true is enough.
+--
+-- The aura check is the one that actually catches Forever.  It reports
+-- WOW_PROJECT_ID 18, not WOW_PROJECT_MAINLINE (1), seen in game on 1.60.1
+-- interface 16001, 2026-10-16.  Do not reduce this to the project check: that
+-- is what let the forbidden registration through in the first place.
+TT.isMidnightEngine =
+       (UnitBuff_ == nil and UnitDebuff_ == nil)
+    or (WOW_PROJECT_ID ~= nil and WOW_PROJECT_MAINLINE ~= nil
+        and WOW_PROJECT_ID == WOW_PROJECT_MAINLINE)
+TT.canUseCombatLog = not TT.isMidnightEngine
+
+-- Addon metadata moved under C_AddOns on the retail engine.
+local GetMetadata = (C_AddOns and C_AddOns.GetAddOnMetadata) or GetAddOnMetadata
+TT.version = (GetMetadata and GetMetadata("TimbersTimers", "Version")) or "unknown"
+
+-- Aura lookup, player-cast auras only.  The positional globals were removed on
+-- the retail engine; C_UnitAuras returns a table instead.  Both are flattened
+-- to the five fields the addon uses so call sites read the same on every
+-- client.
+--
+-- The PLAYER filter makes the client decide whether we cast the aura, so the
+-- addon never reads the caster itself.  That matters inside instances, where
+-- the Midnight engine is liable to hand back unit state as a secret value:
+-- a caster we cannot compare would mean no bars at all, exactly where DoT
+-- timers are worth having.
+function TT.GetAura(unit, index, isDebuff)
+    -- Spelled out rather than "isDebuff and x or y": that idiom falls through
+    -- to the buff lookup on a client that has UnitBuff but not UnitDebuff.
+    local legacy
+    if isDebuff then legacy = UnitDebuff_ else legacy = UnitBuff_ end
+    if legacy then
+        local name, icon, count, _, duration, expiresAt = legacy(unit, index, "PLAYER")
+        return name, icon, count, duration, expiresAt
+    end
+    if not GetAuraDataByIndex then return nil end
+    local a = GetAuraDataByIndex(unit, index, isDebuff and "HARMFUL|PLAYER" or "HELPFUL|PLAYER")
+    if not a then return nil end
+    return a.name, a.icon, a.applications, a.duration, a.expirationTime
+end
+
+-- ============================================================
 -- DEFAULTS
 -- ============================================================
 local DEFAULTS = {
@@ -94,6 +177,23 @@ SlashCmdList["TIMBERSTIMERS"] = function(msg)
         TT.frame:ClearAllPoints()
         TT.frame:SetPoint("TOPLEFT", UIParent, "TOPLEFT", sv.x, sv.y)
         say("Position reset.")
+    elseif msg == "debug" then
+        -- Reports what the addon believes about this client, so a wrong guess
+        -- shows up here instead of as a blocked-action dialog.
+        local iface = select(4, GetBuildInfo())
+        say(("version %s, interface %s"):format(TT.version, tostring(iface)))
+        say(("WOW_PROJECT_ID=%s mainline=%s -> midnight engine: %s")
+            :format(tostring(WOW_PROJECT_ID), tostring(WOW_PROJECT_MAINLINE),
+                    tostring(TT.isMidnightEngine)))
+        say(("aura api: UnitBuff=%s GetAuraDataByIndex=%s"):format(
+            type(UnitBuff_), type(GetAuraDataByIndex)))
+        say("canUseCombatLog: " .. tostring(TT.canUseCombatLog))
+        for _, e in ipairs({ "PLAYER_LOGIN", "UNIT_AURA", "PLAYER_TARGET_CHANGED",
+                             "PLAYER_FOCUS_CHANGED", "PLAYER_ENTERING_WORLD",
+                             "COMBAT_LOG_EVENT_UNFILTERED", "GROUP_ROSTER_UPDATE" }) do
+            local ok, reg = pcall(TT.frame.IsEventRegistered, TT.frame, e)
+            say(("  %-30s %s"):format(e, ok and tostring(reg) or "?"))
+        end
     elseif msg == "show" then
         sv.headerVisible = true
         if TT.titleFrame then TT.titleFrame:Show() end
@@ -103,7 +203,7 @@ SlashCmdList["TIMBERSTIMERS"] = function(msg)
         if TT.titleFrame then TT.titleFrame:Hide() end
         say("Header hidden.")
     else
-        say("Commands: lock | unlock | reset | show | hide")
+        say("Commands: lock | unlock | reset | show | hide | debug")
     end
 end
 
@@ -139,7 +239,9 @@ TT.frame:RegisterEvent("UNIT_AURA")
 TT.frame:RegisterEvent("PLAYER_TARGET_CHANGED")
 TT.frame:RegisterEvent("PLAYER_FOCUS_CHANGED")
 TT.frame:RegisterEvent("PLAYER_ENTERING_WORLD")
-TT.frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+if TT.canUseCombatLog then
+    TT.frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+end
 TT.frame:RegisterEvent("GROUP_ROSTER_UPDATE")
 
 TT.frame:SetScript("OnEvent", function(self, event, ...)
@@ -148,7 +250,7 @@ TT.frame:SetScript("OnEvent", function(self, event, ...)
     elseif event == "UNIT_AURA"                  then TT:OnUnitAura(...)
     elseif event == "PLAYER_TARGET_CHANGED"      then TT:OnUnitScan("target")
     elseif event == "PLAYER_FOCUS_CHANGED"       then TT:OnUnitScan("focus")
-    elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then TT:OnCombatLog(...)
+    elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then TT:OnCombatLog()
     elseif event == "GROUP_ROSTER_UPDATE"        then TT:RefreshAll()
     end
 end)
@@ -197,7 +299,8 @@ function TT:OnLoad()
     if sv.headerVisible then self.titleFrame:Show() else self.titleFrame:Hide() end
 
     DEFAULT_CHAT_FRAME:AddMessage(
-        "|cff00ff99Timber's Timers|r loaded.  /tt  lock|unlock|reset|show|hide"
+        "|cff00ff99Timber's Timers|r " .. TT.version
+            .. " loaded.  /tt  lock|unlock|reset|show|hide|debug"
     )
 end
 
@@ -210,52 +313,37 @@ end
 -- ============================================================
 -- AURA SCANNING
 -- ============================================================
+local function collectAuras(unit, filter, auras, isDebuff, limit)
+    for i = 1, limit do
+        local name, icon, count, duration, expiresAt = TT.GetAura(unit, i, isDebuff)
+        -- A secret value here would error on the tests below, so the aura is
+        -- skipped.  The scan continues: later indices may be readable.
+        if TT.IsReadable(name, count, duration, expiresAt) then
+            if not name then break end
+            if not filter or filter[name] then
+                local inRange = duration and duration > 0 and (duration <= 120 or TT.forcedTrack[name])
+                if inRange then
+                    auras[name] = {
+                        name         = name,
+                        icon         = icon,
+                        duration     = duration,
+                        expiresAt    = expiresAt,
+                        count        = count,
+                        isDebuff     = isDebuff,
+                        tickInterval = TT.tickSpells[name],
+                    }
+                end
+            end
+        end
+    end
+end
+
 -- filter: optional set of spell names; when provided only those spells are tracked
 function TT:ScanUnit(unit, filter)
-    local playerName = UnitName("player")
     local auras = {}
 
-    for i = 1, 40 do
-        local name, icon, count, _, duration, expiresAt, caster =
-            UnitDebuff(unit, i)
-        if not name then break end
-        if not filter or filter[name] then
-            local byPlayer = (caster == "player" or caster == playerName)
-            local inRange  = duration and duration > 0 and (duration <= 120 or TT.forcedTrack[name])
-            if inRange and byPlayer then
-                auras[name] = {
-                    name         = name,
-                    icon         = icon,
-                    duration     = duration,
-                    expiresAt    = expiresAt,
-                    count        = count,
-                    isDebuff     = true,
-                    tickInterval = TT.tickSpells[name],
-                }
-            end
-        end
-    end
-
-    for i = 1, 32 do
-        local name, icon, count, _, duration, expiresAt, caster =
-            UnitBuff(unit, i)
-        if not name then break end
-        if not filter or filter[name] then
-            local byPlayer = (caster == "player" or caster == playerName)
-            local inRange  = duration and duration > 0 and (duration <= 120 or TT.forcedTrack[name])
-            if inRange and byPlayer then
-                auras[name] = {
-                    name         = name,
-                    icon         = icon,
-                    duration     = duration,
-                    expiresAt    = expiresAt,
-                    count        = count,
-                    isDebuff     = false,
-                    tickInterval = TT.tickSpells[name],
-                }
-            end
-        end
-    end
+    collectAuras(unit, filter, auras, true,  40)
+    collectAuras(unit, filter, auras, false, 32)
 
     return auras
 end
@@ -264,6 +352,7 @@ end
 -- EVENT HANDLERS
 -- ============================================================
 function TT:OnUnitAura(unit)
+    if not TT.IsReadable(unit) then return end
     if unit == "player" or unit == "target" or unit == "focus"
     or unit == "pet"    or unit:match("^party%d$") then
         self:OnUnitScan(unit)
@@ -272,9 +361,11 @@ function TT:OnUnitAura(unit)
     end
 end
 
-function TT:OnCombatLog(...)
-    if select(2, ...) ~= "UNIT_DIED" then return end
-    local destGUID = select(8, ...)
+function TT:OnCombatLog()
+    if not GetCombatLogEvent then return end
+    local _, subevent, _, _, _, _, _, destGUID = GetCombatLogEvent()
+    if not TT.IsReadable(subevent, destGUID) then return end
+    if subevent ~= "UNIT_DIED" then return end
     if destGUID and self.tracked[destGUID] then
         self:RemoveGUID(destGUID)
     end
@@ -282,9 +373,10 @@ end
 
 function TT:OnUnitScan(unit, filter)
     local guid = UnitGUID(unit)
-    if not guid then return end
-    local name = UnitName(unit) or guid
-    self:UpdateTrackedUnit(guid, name, unit, filter)
+    if not TT.IsReadable(guid) or not guid then return end
+    local name = UnitName(unit)
+    if not TT.IsReadable(name) then name = nil end
+    self:UpdateTrackedUnit(guid, name or guid, unit, filter)
 end
 
 function TT:RefreshAll()

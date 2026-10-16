@@ -1,4 +1,4 @@
-## Interface: 20506
+## Interface: 16001, 20506
 ## Title: Timber's Timers
 ## Notes: Tracks short-term buffs and debuffs with countdown bars
 ## Author: Timberwind-DreamscytheUS
